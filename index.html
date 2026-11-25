@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>智慧分帳</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    * { -webkit-tap-highlight-color: transparent; }
+    input[type=number]::-webkit-inner-spin-button,
+    input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; }
+    input[type=number] { -moz-appearance: textfield; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; }
+    .slide-up { animation: slideUp .2s ease-out; }
+    @keyframes slideUp { from { transform: translateY(14px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+  </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+  <div id="app"></div>
+  <div id="toast"
+    class="fixed bottom-8 left-1/2 -translate-x-1/2 bg-gray-800 text-white px-5 py-2.5 rounded-full text-sm shadow-xl opacity-0 pointer-events-none z-[100] transition-all duration-300 whitespace-nowrap"></div>
+<script>
+// ═══════════════════════════ UTILS ════════════════════════════
+const uuid = () =>
+  typeof crypto !== 'undefined' && crypto.randomUUID
+    ? crypto.randomUUID()
+    : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+        const r = Math.random() * 16 | 0;
+        return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+      });
+
+const esc = s => String(s ?? '')
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+const fmt = n => { const v = Math.round(Number(n) * 10) / 10; return v % 1 === 0 ? String(v) : v.toFixed(1); };
+const today = () => new Date().toISOString().split('T')[0];
+const COLORS = ['#6366f1','#8b5cf6','#06b6d4','#10b981','#f59e0b','#ef4444','#ec4899','#14b8a6','#f97316','#84cc16'];
+
+// ═══════════════════════════ STATE ════════════════════════════
+const S = { view: 'home', ledgerId: null, tab: 'expenses', ledgers: {}, modal: null, pendingImport: null };
+
+// ══════════════════════ LOCALSTORAGE ══════════════════════════
+const SK = 'splitbill_v1';
+function load() { try { const r = localStorage.getItem(SK); if (r) S.ledgers = JSON.parse(r); } catch(_){} }
+function save() { try { localStorage.setItem(SK, JSON.stringify(S.ledgers)); } catch(_){} }
+
+// ══════════════════════ URL SHARE ═════════════════════════════
+function encodeShare(l) { return btoa(encodeURIComponent(JSON.stringify(l))); }
+function decodeShare(s) { try { return JSON.parse(decodeURIComponent(atob(s))); } catch(_) { return null; } }
+function getShareUrl(id) {
+  const l = S.ledgers[id]; if (!l) return '';
+  return location.href.split('#')[0] + '#share=' + encodeShare(l);
+}
+function checkHash() {
+  const h = location.hash; if (!h.startsWith('#share=')) return;
+  const l = decodeShare(h.slice(7));
+  if (l && l.id && Array.isArray(l.members) && Array.isArray(l.expenses)) {
+    S.pendingImport = l; history.replaceState(null, '', location.pathname);
+  }
+}
+
+// ═══════════════ SETTLEMENT (minimise transactions) ════════════
+function settle(ledger) {
+  const bal = {};
+  ledger.members.forEach(m => { bal[m.id] = 0; });
+  ledger.expenses.forEach(exp => {
+    bal[exp.paidBy] = (bal[exp.paidBy] || 0) + exp.amount;
+    exp.splits.forEach(sp => { bal[sp.memberId] = (bal[sp.memberId] || 0) - sp.amount; });
+  });
+  const pos = [], neg = [];
+  Object.entries(bal).forEach(([id, v]) => {
+    if (v >  0.005) pos.push({ id, v });
+    if (v < -0.005) neg.push({ id, v: -v });
+  });
+  pos.sort((a, b) => b.v - a.v); neg.sort((a, b) => b.v - a.v);
+  const txs = []; let i = 0, j = 0;
+  while (i < pos.length && j < neg.length) {
+    const amt = Math.min(pos[i].v, neg[j].v);
+    if (amt > 0.005) txs.push({ from: neg[j].id, to: pos[i].id, amount: Math.round(amt * 100) / 100 });
+    pos[i].v -= amt; neg[j].v -= amt;
+    if (pos[i].v < 0.005) i++; if (neg[j].v < 0.005) j++;
+  }
+  return { bal, txs };
+}
+
+// ══════════════════════════ TOAST ═════════════════════════════
+let _tt;
+function toast(msg) {
+  const el = document.getElementById('toast'); if (!el) return;
+  el.textContent = msg; el.style.opacity = '1';
+  clearTimeout(_tt); _tt = setTimeout(() => { el.style.opacity = '0'; }, 2300);
+}
+
+// ══════════════════════════ ACTIONS ═══════════════════════════
+const A = {
+  go: (view, id = null) => { S.view = view; S.ledgerId = id; S.tab = 'expenses'; S.modal = null; render(); },
+  tab: t => { S.tab = t; render(); },
+  newLedger: (name, currency) => {
+    const id = uuid();
+    S.ledgers[id] = { id, name, currency: currency || 'NT$', createdAt: Date.now(), members: [], expenses: [] };
+    save(); A.go('ledger', id);
+  },
+  delLedger: id => {
+    if (!confirm('確定要刪除這個帳本？')) return;
+    delete S.ledgers[id]; save(); render();
+  },
+  addMember: name => { const l = cur(); if (!l) return; l.members.push({ id: uuid(), name }); save(); render(); },
+  delMember: id => {
+    const l = cur(); if (!l) return;
+    if (l.expenses.some(e => e.paidBy === id || e.splits.some(s => s.memberId === id))) {
+      toast('此成員已有支出紀錄，無法刪除'); return;
+    }
+    l.members = l.members.filter(m => m.id !== id); save(); render();
+  },
+  saveExpense: (data, editId) => {
+    const l = cur(); if (!l) return;
+    if (editId) {
+      const idx = l.expenses.findIndex(e => e.id === editId);
+      if (idx !== -1) l.expenses[idx] = { ...l.expenses[idx], ...data };
+    } else {
+      l.expenses.push({ id: uuid(), createdAt: Date.now(), ...data });
+    }
+    save(); S.modal = null; render();
+  },
+  delExpense: id => {
+    const l = cur(); if (!l) return;
+    if (!confirm('確定刪除此筆支出？')) return;
+    l.expenses = l.expenses.filter(e => e.id !== id); save(); render();
+  },
+  modal: (type, data = null) => { S.modal = { type, data }; render(); },
+  closeModal: () => { S.modal = null; render(); },
+  importLedger: l => {
+    if (S.ledgers[l.id]) l = { ...l, id: uuid(), name: l.name + '（匯入）' };
+    S.ledgers[l.id] = l; save(); S.pendingImport = null; A.go('ledger', l.id);
+  },
+  cancelImport: () => { S.pendingImport = null; render(); },
+  share: id => {
+    const url = getShareUrl(id); if (!url) return;
+    if (navigator.clipboard) { navigator.clipboard.writeText(url).then(() => toast('🔗 分享連結已複製！')); }
+    else { prompt('請複製此連結：', url); }
+  }
+};
+function cur() { return S.ledgers[S.ledgerId] || null; }
+function mname(l, id) { return (l.members.find(m => m.id === id) || {}).name || '？'; }
+
+// ══════════════════════════ HOME ══════════════════════════════
+function renderHome() {
+  const list = Object.values(S.ledgers).sort((a, b) => b.createdAt - a.createdAt);
+  return `<div class="max-w-lg mx-auto px-4 py-8 pb-16">
+    <div class="flex items-center justify-between mb-8">
+      <div>
+        <h1 class="text-2xl font-bold text-gray-900">💰 智慧分帳</h1>
+        <p class="text-sm text-gray-400 mt-0.5">聚餐 · 旅遊 · 代墊一鍵搞定</p>
+      </div>
+      <button onclick="A.modal('newLedger')"
+        class="flex items-center gap-1.5 bg-indigo-600 text-white px-4 py-2.5 rounded-2xl font-semibold shadow-md hover:bg-indigo-700 active:scale-95 transition-all">
+        ＋ 新帳本
+      </button>
+    </div>
+    ${list.length === 0 ? `
+    <div class="text-center py-24 text-gray-300">
+      <div class="text-6xl mb-4">🧾</div>
+      <p class="text-base font-medium text-gray-400">還沒有帳本</p>
+      <p class="text-sm mt-1 text-gray-300">點「新帳本」開始記帳吧！</p>
+    </div>` : `
+    <div class="space-y-3">
+      ${list.map(l => {
+        const total = l.expenses.reduce((s, e) => s + e.amount, 0);
+        const dt = new Date(l.createdAt).toLocaleDateString('zh-TW', { month: 'numeric', day: 'numeric' });
+        return `<div class="bg-white rounded-2xl border border-gray-100 shadow-sm px-4 py-4 flex items-center cursor-pointer hover:shadow-md hover:-translate-y-0.5 transition-all"
+          onclick="A.go('ledger','${l.id}')">
+          <div class="flex-1 min-w-0">
+            <div class="font-semibold text-gray-900 truncate">${esc(l.name)}</div>
+            <div class="text-xs text-gray-400 mt-0.5">${dt} · ${l.members.length} 人 · ${l.expenses.length} 筆</div>
+          </div>
+          <div class="text-right flex flex-col items-end ml-3">
+            <div class="font-bold text-indigo-600">${l.currency} ${fmt(total)}</div>
+            <button class="text-xs text-red-300 hover:text-red-500 mt-1 transition"
+              onclick="event.stopPropagation();A.delLedger('${l.id}')">刪除</button>
+          </div>
+        </div>`;
+      }).join('')}
+    </div>`}
+  </div>`;
+}
+
+// ═════════════════════════ LEDGER ═════════════════════════════
+function renderLedger() {
+  const l = cur(); if (!l) { S.view = 'home'; return renderHome(); }
+  const tabs = [{id:'expenses',label:'💳 支出'},{id:'members',label:'👥 成員'},{id:'settlement',label:'🧮 結算'}];
+  const bodyFn = { expenses: renderExpenses, members: renderMembers, settlement: renderSettlement };
+  return `<div class="max-w-lg mx-auto pb-16">
+    <div class="sticky top-0 z-10 bg-white border-b border-gray-100 shadow-sm">
+      <div class="flex items-center px-4 py-3 gap-3">
+        <button onclick="A.go('home')" class="text-gray-400 hover:text-gray-700 text-2xl leading-none transition">‹</button>
+        <div class="flex-1 min-w-0">
+          <div class="font-bold text-gray-900 truncate">${esc(l.name)}</div>
+          <div class="text-xs text-gray-400">${l.members.length} 人 · ${l.expenses.length} 筆支出</div>
+        </div>
+      </div>
+      <div class="flex">
+        ${tabs.map(t => `<button onclick="A.tab('${t.id}')"
+          class="flex-1 py-2.5 text-sm font-medium transition border-b-2 ${S.tab === t.id
+            ? 'border-indigo-500 text-indigo-600' : 'border-transparent text-gray-400 hover:text-gray-600'}">
+          ${t.label}</button>`).join('')}
+      </div>
+    </div>
+    <div class="slide-up">${(bodyFn[S.tab] || renderExpenses)(l)}</div>
+  </div>`;
+}
+
+// ══════════════════════ TAB: 支出 ═════════════════════════════
+function renderExpenses(l) {
+  const exps = [...l.expenses].sort((a, b) =>
+    (b.date||'') > (a.date||'') ? 1 : (b.date||'') < (a.date||'') ? -1 : b.createdAt - a.createdAt);
+  return `<div class="p-4 space-y-3">
+    <button onclick="A.modal('expense')"
+      class="w-full flex items-center justify-center gap-2 bg-indigo-600 text-white py-3 rounded-2xl font-semibold shadow hover:bg-indigo-700 active:scale-[.98] transition-all">
+      ＋ 新增支出
+    </button>
+    ${exps.length === 0 ? `
+    <div class="text-center py-16 text-gray-300">
+      <div class="text-5xl mb-3">📝</div>
+      <p class="text-sm text-gray-400">還沒有支出紀錄</p>
+    </div>` : exps.map(e => `
+    <div class="bg-white rounded-2xl border border-gray-100 shadow-sm p-4">
+      <div class="flex items-start justify-between gap-3">
+        <div class="flex-1 min-w-0">
+          <div class="font-semibold text-gray-900 truncate">${esc(e.title)}</div>
+          <div class="text-xs text-gray-400 mt-1 flex flex-wrap gap-x-2 gap-y-0.5">
+            <span>${esc(mname(l, e.paidBy))} 付款</span>
+            <span>分攤 ${e.splits.length} 人</span>
+            ${e.date ? `<span>${e.date}</span>` : ''}
+          </div>
+        </div>
+        <div class="flex flex-col items-end gap-1 flex-shrink-0">
+          <div class="font-bold text-gray-900">${l.currency} ${fmt(e.amount)}</div>
+          <div class="flex gap-3 text-xs">
+            <button onclick="A.modal('expense','${e.id}')" class="text-indigo-500 hover:text-indigo-700">編輯</button>
+            <button onclick="A.delExpense('${e.id}')" class="text-red-400 hover:text-red-600">刪除</button>
+          </div>
+        </div>
+      </div>
+    </div>`).join('')}
+  </div>`;
+}
+
+// ══════════════════════ TAB: 成員 ═════════════════════════════
+function renderMembers(l) {
+  const { bal } = settle(l);
+  return `<div class="p-4 space-y-4">
+    <div class="flex gap-2">
+      <input id="nm" type="text" maxlength="20" placeholder="輸入成員姓名"
+        class="flex-1 border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
+        onkeydown="if(event.key==='Enter'){const v=this.value.trim();if(v){A.addMember(v);this.value=''}}">
+      <button onclick="const v=document.getElementById('nm').value.trim();if(v){A.addMember(v);document.getElementById('nm').value=''}"
+        class="bg-indigo-600 text-white px-4 py-2 rounded-xl text-sm font-semibold hover:bg-indigo-700 transition">新增</button>
+    </div>
+    ${l.members.length === 0 ? `
+    <div class="text-center py-12 text-gray-300">
+      <div class="text-4xl mb-3">👥</div>
+      <p class="text-sm text-gray-400">先新增成員吧</p>
+    </div>` : `
+    <div class="space-y-2">
+      ${l.members.map((m, i) => {
+        const b = bal[m.id] || 0;
+        const color = b > 0.005 ? 'text-green-600' : b < -0.005 ? 'text-red-500' : 'text-gray-400';
+        const label = b > 0.005 ? `應收 ${l.currency} ${fmt(b)}`
+          : b < -0.005 ? `應付 ${l.currency} ${fmt(-b)}` : '已結清';
+        return `<div class="bg-white rounded-xl border border-gray-100 shadow-sm p-3 flex items-center gap-3">
+          <div class="w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm flex-shrink-0"
+            style="background:${COLORS[i%COLORS.length]}22;color:${COLORS[i%COLORS.length]}">
+            ${esc(m.name.charAt(0))}
+          </div>
+          <span class="flex-1 font-medium text-gray-800 text-sm">${esc(m.name)}</span>
+          <span class="text-xs font-semibold ${color}">${label}</span>
+          <button onclick="A.delMember('${m.id}')" class="text-gray-200 hover:text-red-400 transition text-xl leading-none ml-1">×</button>
+        </div>`;
+      }).join('')}
+    </div>
+    ${l.expenses.length > 0 ? `
+    <div class="bg-white rounded-2xl border border-gray-100 shadow-sm p-4">
+      <div class="font-semibold text-gray-700 text-sm mb-3">💸 各人付款比例</div>
+      <canvas id="chart" height="220"></canvas>
+    </div>` : ''}`}
+  </div>`;
+}
+
+// ═════════════════════ TAB: 結算 ══════════════════════════════
+function renderSettlement(l) {
+  const { bal, txs } = settle(l);
+  const total = l.expenses.reduce((s, e) => s + e.amount, 0);
+  return `<div class="p-4 space-y-4">
+    <div class="bg-gradient-to-br from-indigo-500 to-purple-600 rounded-2xl p-5 text-white">
+      <div class="text-sm opacity-80 font-medium mb-1">總支出</div>
+      <div class="text-3xl font-bold">${l.currency} ${fmt(total)}</div>
+      <div class="text-sm opacity-70 mt-1">${l.expenses.length} 筆支出 · ${l.members.length} 位成員</div>
+    </div>
+    <div>
+      <div class="font-semibold text-gray-700 mb-3">📋 結算方案
+        <span class="text-xs text-gray-400 font-normal ml-1">（已最小化轉帳次數）</span>
+      </div>
+      ${txs.length === 0 ? `
+      <div class="text-center py-10 text-gray-300">
+        <div class="text-4xl mb-2">✅</div>
+        <p class="text-sm text-gray-400">${l.expenses.length === 0 ? '還沒有支出紀錄' : '大家都結清了！'}</p>
+      </div>` : `
+      <div class="space-y-2">
+        ${txs.map(t => `
+        <div class="bg-white rounded-xl border border-gray-100 shadow-sm flex items-center gap-3 px-4 py-3">
+          <div class="font-medium text-gray-900 flex-1 text-sm">${esc(mname(l, t.from))}</div>
+          <div class="text-gray-300 text-xl">→</div>
+          <div class="font-medium text-gray-900 flex-1 text-sm text-right">${esc(mname(l, t.to))}</div>
+          <div class="font-bold text-indigo-600 text-sm ml-2 flex-shrink-0">${l.currency} ${fmt(t.amount)}</div>
+        </div>`).join('')}
+      </div>`}
+    </div>
+    ${l.members.length > 0 ? `
+    <div>
+      <div class="font-semibold text-gray-700 mb-3">📊 個人餘額明細</div>
+      <div class="space-y-2">
+        ${l.members.map(m => {
+          const b = bal[m.id] || 0;
+          const paid = l.expenses.filter(e => e.paidBy === m.id).reduce((s, e) => s + e.amount, 0);
+          const owed = l.expenses.flatMap(e => e.splits).filter(s => s.memberId === m.id).reduce((s, sp) => s + sp.amount, 0);
+          const color = b > 0.005 ? 'text-green-600 bg-green-50' : b < -0.005 ? 'text-red-500 bg-red-50' : 'text-gray-400 bg-gray-50';
+          const tag = b > 0.005 ? `應收 ${l.currency} ${fmt(b)}` : b < -0.005 ? `應付 ${l.currency} ${fmt(-b)}` : '已結清';
+          return `<div class="bg-white rounded-xl border border-gray-100 shadow-sm px-4 py-3">
+            <div class="flex items-center justify-between mb-1">
+              <span class="font-medium text-gray-800 text-sm">${esc(m.name)}</span>
+              <span class="text-xs font-semibold px-2 py-0.5 rounded-full ${color}">${tag}</span>
+            </div>
+            <div class="flex gap-4 text-xs text-gray-400">
+              <span>已付 ${l.currency} ${fmt(paid)}</span>
+              <span>應付 ${l.currency} ${fmt(owed)}</span>
+            </div>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>` : ''}
+    <button onclick="A.share('${l.id}')"
+      class="w-full flex items-center justify-center gap-2 border-2 border-indigo-200 text-indigo-600 py-3 rounded-2xl font-semibold hover:bg-indigo-50 active:scale-[.98] transition-all">
+      🔗 複製分享連結
+    </button>
+  </div>`;
+}
+
+// ══════════════════ MODAL: 新增/編輯支出 ══════════════════════
+function renderExpenseModal(l, editExp) {
+  const isEdit    = !!editExp;
+  const defTitle  = isEdit ? editExp.title  : '';
+  const defAmt    = isEdit ? editExp.amount : '';
+  const defDate   = isEdit ? (editExp.date || today()) : today();
+  const defPaidBy = isEdit ? editExp.paidBy : (l.members[0] ? l.members[0].id : '');
+  const defMode   = isEdit ? (editExp.splitMode || 'equal') : 'equal';
+  const selIds    = isEdit ? editExp.splits.map(s => s.memberId) : l.members.map(m => m.id);
+  const custMap   = {};
+  if (isEdit) editExp.splits.forEach(s => { custMap[s.memberId] = s.amount; });
+
+  return `<div class="fixed inset-0 bg-black/50 flex items-end sm:items-center justify-center z-50 p-4" id="modal-bg"
+    onclick="if(event.target.id==='modal-bg')A.closeModal()">
+    <div class="bg-white rounded-3xl rounded-b-2xl sm:rounded-3xl w-full max-w-md max-h-[90vh] overflow-y-auto shadow-2xl"
+      onclick="event.stopPropagation()">
+      <div class="flex items-center justify-between px-5 pt-5 pb-3 border-b border-gray-100">
+        <h2 class="font-bold text-gray-900 text-lg">${isEdit ? '編輯支出' : '新增支出'}</h2>
+        <button onclick="A.closeModal()" class="text-gray-300 hover:text-gray-500 text-2xl leading-none">×</button>
+      </div>
+      <form id="expForm" class="p-5 space-y-5" onsubmit="submitExp(event,'${isEdit ? editExp.id : ''}')">
+
+        <div>
+          <label class="block text-sm font-semibold text-gray-700 mb-1.5">支出名稱</label>
+          <input name="title" type="text" value="${esc(defTitle)}" placeholder="例：晚餐、高鐵票…" required autofocus
+            class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">
+        </div>
+
+        <div>
+          <label class="block text-sm font-semibold text-gray-700 mb-1.5">金額</label>
+          <div class="flex border border-gray-200 rounded-xl overflow-hidden focus-within:ring-2 focus-within:ring-indigo-300">
+            <span class="bg-gray-50 border-r border-gray-200 px-3 py-2.5 text-sm text-gray-500 flex items-center select-none">${esc(l.currency)}</span>
+            <input name="amount" id="amtInput" type="number" value="${defAmt}" min="0.01" step="any" placeholder="0" required
+              class="flex-1 px-3 py-2.5 text-sm focus:outline-none" oninput="calcSplit()">
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-sm font-semibold text-gray-700 mb-1.5">日期</label>
+          <input name="date" type="date" value="${defDate}"
+            class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">
+        </div>
+
+        <div>
+          <label class="block text-sm font-semibold text-gray-700 mb-1.5">付款人</label>
+          ${l.members.length === 0
+            ? '<p class="text-sm text-red-400">請先到「成員」分頁新增成員</p>'
+            : `<select name="paidBy" class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">
+                ${l.members.map(m => `<option value="${m.id}" ${m.id === defPaidBy ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}
+               </select>`}
+        </div>
+
+        <div>
+          <label class="block text-sm font-semibold text-gray-700 mb-2">分攤方式</label>
+          <div class="grid grid-cols-2 gap-2">
+            <button type="button" id="btnEqual" onclick="setSplitMode('equal')"
+              class="py-2.5 rounded-xl text-sm font-semibold border-2 transition ${defMode === 'equal' ? 'border-indigo-500 bg-indigo-50 text-indigo-700' : 'border-gray-200 text-gray-500'}">均分</button>
+            <button type="button" id="btnCustom" onclick="setSplitMode('custom')"
+              class="py-2.5 rounded-xl text-sm font-semibold border-2 transition ${defMode === 'custom' ? 'border-indigo-500 bg-indigo-50 text-indigo-700' : 'border-gray-200 text-gray-500'}">自訂金額</button>
+          </div>
+          <input type="hidden" name="splitMode" id="splitModeField" value="${defMode}">
+        </div>
+
+        <div>
+          <label class="block text-sm font-semibold text-gray-700 mb-2">分攤對象</label>
+          <div class="space-y-2">
+            ${l.members.map(m => {
+              const sel = selIds.includes(m.id);
+              const ca  = custMap[m.id] || '';
+              return `<div class="flex items-center gap-2 border border-gray-100 rounded-xl p-2.5 bg-gray-50/50">
+                <input type="checkbox" id="chk_${m.id}" value="${m.id}" ${sel ? 'checked' : ''}
+                  class="w-4 h-4 accent-indigo-600 cursor-pointer flex-shrink-0" onchange="calcSplit()">
+                <label for="chk_${m.id}" class="flex-1 text-sm font-medium text-gray-700 cursor-pointer select-none">${esc(m.name)}</label>
+                <span class="text-xs text-indigo-500 font-medium equal-lbl" id="eql_${m.id}"></span>
+                <input type="number" id="cust_${m.id}" name="cust_${m.id}" value="${ca}"
+                  min="0" step="any" placeholder="0"
+                  class="w-20 border border-gray-200 rounded-lg px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 cust-input ${defMode === 'custom' ? '' : 'hidden'}"
+                  oninput="checkTotal()">
+              </div>`;
+            }).join('')}
+          </div>
+        </div>
+
+        <div id="totalWarn" class="hidden text-sm text-red-500 bg-red-50 rounded-xl p-3 text-center">
+          ⚠️ 自訂金額合計與支出金額不符
+        </div>
+
+        <button type="submit"
+          class="w-full bg-indigo-600 text-white py-3 rounded-2xl font-bold hover:bg-indigo-700 active:scale-[.98] transition-all">
+          ${isEdit ? '儲存變更' : '新增支出'}
+        </button>
+      </form>
+    </div>
+  </div>`;
+}
+
+// ═══════════════════ MODAL: 新帳本 ════════════════════════════
+function renderNewLedgerModal() {
+  return `<div class="fixed inset-0 bg-black/50 flex items-end sm:items-center justify-center z-50 p-4" id="modal-bg"
+    onclick="if(event.target.id==='modal-bg')A.closeModal()">
+    <div class="bg-white rounded-3xl rounded-b-2xl sm:rounded-3xl w-full max-w-md shadow-2xl" onclick="event.stopPropagation()">
+      <div class="flex items-center justify-between px-5 pt-5 pb-3 border-b border-gray-100">
+        <h2 class="font-bold text-gray-900 text-lg">建立新帳本</h2>
+        <button onclick="A.closeModal()" class="text-gray-300 hover:text-gray-500 text-2xl leading-none">×</button>
+      </div>
+      <form class="p-5 space-y-4"
+        onsubmit="event.preventDefault();const f=this;const n=f.querySelector('[name=name]').value.trim();const c=f.querySelector('[name=cur]').value.trim()||'NT$';if(n)A.newLedger(n,c)">
+        <div>
+          <label class="block text-sm font-semibold text-gray-700 mb-1.5">帳本名稱</label>
+          <input name="name" type="text" placeholder="例：墾丁旅遊、跨年聚餐…" required autofocus
+            class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">
+        </div>
+        <div>
+          <label class="block text-sm font-semibold text-gray-700 mb-1.5">幣別符號</label>
+          <input name="cur" type="text" value="NT$" maxlength="5"
+            class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">
+        </div>
+        <button type="submit"
+          class="w-full bg-indigo-600 text-white py-3 rounded-2xl font-bold hover:bg-indigo-700 active:scale-[.98] transition-all">
+          建立帳本
+        </button>
+      </form>
+    </div>
+  </div>`;
+}
+
+// ══════════════════ MODAL: 匯入帳本 ══════════════════════════
+function renderImportModal(l) {
+  return `<div class="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+    <div class="bg-white rounded-3xl w-full max-w-sm p-6 text-center shadow-2xl slide-up">
+      <div class="text-5xl mb-3">📥</div>
+      <h2 class="font-bold text-gray-900 text-lg mb-1">收到分享的帳本</h2>
+      <p class="text-gray-700 font-semibold mb-1">「${esc(l.name)}」</p>
+      <p class="text-gray-400 text-xs mb-6">${l.members.length} 位成員 · ${l.expenses.length} 筆支出</p>
+      <div class="flex gap-3">
+        <button onclick="A.cancelImport()"
+          class="flex-1 py-2.5 border-2 border-gray-200 rounded-xl text-gray-500 font-semibold hover:bg-gray-50 transition">取消</button>
+        <button onclick="A.importLedger(S.pendingImport)"
+          class="flex-1 py-2.5 bg-indigo-600 text-white rounded-xl font-bold hover:bg-indigo-700 transition">匯入帳本</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+// ══════════════════════ FORM HELPERS ══════════════════════════
+window.setSplitMode = function(mode) {
+  const field = document.getElementById('splitModeField');
+  if (field) field.value = mode;
+  const btnE = document.getElementById('btnEqual'), btnC = document.getElementById('btnCustom');
+  if (btnE && btnC) {
+    const on = 'border-indigo-500 bg-indigo-50 text-indigo-700', off = 'border-gray-200 text-gray-500';
+    [btnE, btnC].forEach(b => { b.className = b.className.replace(/border-indigo-500|bg-indigo-50|text-indigo-700|border-gray-200|text-gray-500/g,'').replace(/\s+/g,' ').trim(); });
+    btnE.className += ' ' + (mode === 'equal'  ? on : off);
+    btnC.className += ' ' + (mode === 'custom' ? on : off);
+  }
+  document.querySelectorAll('.cust-input').forEach(el => el.classList.toggle('hidden', mode !== 'custom'));
+  document.querySelectorAll('.equal-lbl').forEach(el => el.classList.toggle('hidden', mode === 'custom'));
+  calcSplit();
+};
+
+window.calcSplit = function() {
+  const form = document.getElementById('expForm'); if (!form) return;
+  const mode = document.getElementById('splitModeField') ? document.getElementById('splitModeField').value : '';
+  if (mode !== 'equal') return;
+  const amt = parseFloat(document.getElementById('amtInput') ? document.getElementById('amtInput').value : 0) || 0;
+  const checked = Array.from(form.querySelectorAll('[type=checkbox]:checked'));
+  const pp = checked.length > 0 ? amt / checked.length : 0;
+  form.querySelectorAll('[type=checkbox]').forEach(cb => {
+    const lbl = document.getElementById('eql_' + cb.value);
+    if (lbl) lbl.textContent = cb.checked && checked.length > 0 ? fmt(pp) : '';
+  });
+  checkTotal();
+};
+
+window.checkTotal = function() {
+  const form = document.getElementById('expForm'); if (!form) return;
+  const mode = document.getElementById('splitModeField') ? document.getElementById('splitModeField').value : '';
+  const warn = document.getElementById('totalWarn');
+  if (mode !== 'custom' || !warn) return;
+  const amt = parseFloat(document.getElementById('amtInput') ? document.getElementById('amtInput').value : 0) || 0;
+  let sum = 0;
+  form.querySelectorAll('.cust-input').forEach(el => { sum += parseFloat(el.value) || 0; });
+  warn.classList.toggle('hidden', Math.abs(sum - amt) < 0.01);
+};
+
+window.submitExp = function(event, editId) {
+  event.preventDefault();
+  const form = event.target, l = cur(); if (!l) return;
+  const title  = form.querySelector('[name=title]').value.trim();
+  const amount = parseFloat(form.querySelector('[name=amount]').value);
+  const date   = form.querySelector('[name=date]').value;
+  const paidBy = form.querySelector('[name=paidBy]') ? form.querySelector('[name=paidBy]').value : '';
+  const mode   = form.querySelector('[name=splitMode]').value;
+  if (!title || isNaN(amount) || amount <= 0) { toast('請填寫完整資訊'); return; }
+  if (!paidBy) { toast('請先新增成員'); return; }
+  const sel = Array.from(form.querySelectorAll('[type=checkbox]:checked')).map(cb => cb.value);
+  if (sel.length === 0) { toast('請選擇至少一位分攤對象'); return; }
+  let splits;
+  if (mode === 'equal') {
+    const pp = amount / sel.length;
+    splits = sel.map(id => ({ memberId: id, amount: pp }));
+  } else {
+    splits = sel.map(id => ({ memberId: id, amount: parseFloat(form.querySelector('[name=cust_' + id + ']') ? form.querySelector('[name=cust_' + id + ']').value : 0) || 0 }));
+    const sum = splits.reduce((s, sp) => s + sp.amount, 0);
+    if (Math.abs(sum - amount) > 0.01) { toast('自訂金額合計必須等於支出金額'); return; }
+  }
+  A.saveExpense({ title, amount, date, paidBy, splitMode: mode, splits }, editId || null);
+};
+
+// ═══════════════════════════ CHART ════════════════════════════
+let _chart = null;
+function initChart(l) {
+  const canvas = document.getElementById('chart');
+  if (!canvas || typeof Chart === 'undefined') return;
+  if (_chart) { _chart.destroy(); _chart = null; }
+  const data = l.members.map((m, i) => ({
+    name: m.name,
+    total: l.expenses.filter(e => e.paidBy === m.id).reduce((s, e) => s + e.amount, 0),
+    color: COLORS[i % COLORS.length]
+  })).filter(d => d.total > 0);
+  if (!data.length) return;
+  _chart = new Chart(canvas, {
+    type: 'doughnut',
+    data: {
+      labels: data.map(d => d.name),
+      datasets: [{ data: data.map(d => d.total), backgroundColor: data.map(d => d.color), borderWidth: 3, borderColor: '#fff' }]
+    },
+    options: {
+      responsive: true, cutout: '60%',
+      plugins: {
+        legend: { position: 'bottom', labels: { font: { size: 12 }, padding: 14, boxWidth: 12, boxHeight: 12 } },
+        tooltip: { callbacks: { label: ctx => ' ' + l.currency + ' ' + fmt(ctx.raw) } }
+      }
+    }
+  });
+}
+
+// ══════════════════════ MAIN RENDER ═══════════════════════════
+function render() {
+  const app = document.getElementById('app'); let html = '';
+  if (S.pendingImport) {
+    html = renderImportModal(S.pendingImport);
+  } else {
+    html = S.view === 'ledger' ? renderLedger() : renderHome();
+    if (S.modal) {
+      const l = cur();
+      if (S.modal.type === 'newLedger') html += renderNewLedgerModal();
+      else if (S.modal.type === 'expense' && l) {
+        const exp = S.modal.data ? l.expenses.find(e => e.id === S.modal.data) : null;
+        html += renderExpenseModal(l, exp || null);
+      }
+    }
+  }
+  app.innerHTML = html;
+  if (S.view === 'ledger' && S.tab === 'members') {
+    const l = cur(); if (l && l.expenses.length > 0) setTimeout(() => initChart(l), 60);
+  }
+  if (S.modal && S.modal.type === 'expense') setTimeout(() => calcSplit(), 60);
+}
+
+// ═══════════════════════════ BOOT ═════════════════════════════
+load(); checkHash(); render();
+</script>
+</body>
+</html>
